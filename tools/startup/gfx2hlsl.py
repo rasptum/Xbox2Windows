@@ -26,6 +26,29 @@ def strip_header(code):
     return code[at:] if at >= 0 and at % 4 == 0 else code
 
 
+SDWA_SEL = ('BYTE_0', 'BYTE_1', 'BYTE_2', 'BYTE_3', 'WORD_0', 'WORD_1', 'DWORD')
+
+
+def vop2_sdwa(code, off):
+    """VOP2 with the SDWA extension word, which disasm_rdna2 leaves undecoded for most opcodes:
+    -> ('x2w_sdwa', 'x2w_sdwa vD, src0, src1 op:<op> dst:<sel> unused:<n> s0:<sel> sx0:<0|1> s1:<sel> sx1:<0|1>').
+    Operand neg/abs/clamp/omod bits are refused rather than ignored."""
+    w0, w1 = struct.unpack_from('<2I', code, off)
+    op = D.VOP2_OPS.get((w0 >> 25) & 0x3f, ('?', ''))[0]
+    vdst, vsrc1 = (w0 >> 17) & 0xff, (w0 >> 9) & 0xff
+    if (w1 >> 13) & 0x7 or (w1 >> 20) & 3 or (w1 >> 28) & 3:
+        raise Unsupported('SDWA %s with clamp, omod, neg or abs' % op)
+    src0 = D.decode_s_reg(w1 & 0xff) if (w1 >> 23) & 1 else 'v%d' % (w1 & 0xff)
+    src1 = D.decode_s_reg(vsrc1) if (w1 >> 31) & 1 else 'v%d' % vsrc1
+    sels = [(w1 >> 8) & 7, (w1 >> 16) & 7, (w1 >> 24) & 7]
+    if max(sels) > 6:
+        raise Unsupported('SDWA selector out of range')
+    asm = 'x2w_sdwa v%d, %s, %s op:%s dst:%s unused:%d s0:%s sx0:%d s1:%s sx1:%d' % (
+        vdst, src0, src1, re.sub(r'_e32$', '', op), SDWA_SEL[sels[0]], (w1 >> 11) & 3, SDWA_SEL[sels[1]], (w1 >> 19) & 1,
+        SDWA_SEL[sels[2]], (w1 >> 27) & 1)
+    return 'x2w_sdwa', asm
+
+
 def decode(code):
     out, off = [], 0
     while off + 4 <= len(code):
@@ -33,6 +56,8 @@ def decode(code):
             n, name, asm, _ = D.decode_instruction(code, off)
         except Exception as error:
             raise Unsupported('undecodable word at +0x%x: %s' % (off, error))
+        if name == 'vop2_sdwa' and n == 8:
+            name, asm = vop2_sdwa(code, off)
         out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
@@ -426,6 +451,41 @@ class Stage:
         if pair:
             self.masks.add(d)
             self.set_s(d + 1, '0u')
+
+    def op_v_readfirstlane_b32(self, ops, mods):
+        """One lane: the first active lane's value is this lane's value."""
+        self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
+
+    def op_x2w_sdwa(self, ops, mods):
+        """Integer VOP2 with sub-dword operand selection (see vop2_sdwa). Float forms are refused."""
+        m = dict(x.split(':', 1) for x in mods)
+        base = m['op']
+        if base not in VEC_U or VEC_U[base][0] != 2:
+            raise Unsupported('SDWA %s' % base)
+
+        def pick(tok, sel, sext):
+            expr = self.u(tok)    # a scalar or constant source is subject to its selector too
+            if sel == 'DWORD':
+                return expr
+            shift, bits = {'BYTE_0': (0, 8), 'BYTE_1': (8, 8), 'BYTE_2': (16, 8), 'BYTE_3': (24, 8),
+                           'WORD_0': (0, 16), 'WORD_1': (16, 16)}[sel]
+            if sext == '1':
+                return 'uint(int((%s) << %d) >> %d)' % (expr, 32 - shift - bits, 32 - bits)
+            return '(((%s) >> %d) & 0x%xu)' % (expr, shift, (1 << bits) - 1)
+
+        a, b = pick(ops[1], m['s0'], m['sx0']), pick(ops[2], m['s1'], m['sx1'])
+        value = VEC_U[base][1].format(a, b)
+        d = reg_range(ops[0])[1]
+        if m['dst'] == 'DWORD':
+            return self.set_v(d, value)
+        shift, bits = {'BYTE_0': (0, 8), 'BYTE_1': (8, 8), 'BYTE_2': (16, 8), 'BYTE_3': (24, 8),
+                       'WORD_0': (0, 16), 'WORD_1': (16, 16)}[m['dst']]
+        mask = ((1 << bits) - 1) << shift
+        if m['unused'] == '2':    # UNUSED_PRESERVE
+            return self.set_v(d, '(v%d & 0x%08xu) | (((%s) << %d) & 0x%08xu)' % (d, ~mask & 0xffffffff, value, shift, mask))
+        if m['unused'] == '0':    # UNUSED_PAD: other bits zero
+            return self.set_v(d, '(((%s) << %d) & 0x%08xu)' % (value, shift, mask))
+        raise Unsupported('SDWA dst_unused %s' % m['unused'])
 
     def op_s_load_dwordx4(self, ops, mods, count=4):
         dst, base = reg_range(ops[0]), reg_range(ops[1])
